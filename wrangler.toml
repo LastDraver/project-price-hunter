@@ -1,4 +1,4 @@
-name = "price-hunter"
+name = "project-price-hunter"
 main = "src/index.js"
 compatibility_date = "2026-02-13"
 
@@ -11,4 +11,4 @@ class_name = "DB"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["DB"]
+new_sqlite_classes = ["DB"]
