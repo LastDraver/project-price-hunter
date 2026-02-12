@@ -1,6 +1,6 @@
 name = "project-price-hunter"
 main = "src/index.js"
-compatibility_date = "2026-02-13"
+compatibility_date = "2026-02-12"
 
 [triggers]
 crons = ["*/30 * * * *"]
