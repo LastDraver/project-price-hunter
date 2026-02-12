@@ -1,0 +1,14 @@
+name = "price-hunter"
+main = "src/index.js"
+compatibility_date = "2026-02-13"
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[durable_objects.bindings]]
+name = "DB"
+class_name = "DB"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DB"]
