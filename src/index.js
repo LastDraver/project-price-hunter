@@ -37,10 +37,13 @@ async function runJob(env) {
   // Put a SMALL allowlist here. Start with 5–20 URLs max.
   // Tip: choose product pages that contain JSON-LD Product/Offer.
   const targets = [
-    // Example:
-    // { store: "altex", url: "https://altex.ro/..." },
-    // { store: "emag",  url: "https://www.emag.ro/..." },
-  ];
+  { store: "altex", url: "https://altex.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/" },
+  { store: "emag", url: "https://www.emag.ro/televizor-lg-oled-evo-65g53ls-164-cm-smart-4k-ultra-hd-100-hz-clasa-e-model-2025-oled65g53ls/pd/DSMLL73BM/" },
+  { store: "mediagalaxy", url: "https://mediagalaxy.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/" },
+
+  // replace with your filtered OLX search URL (after you set 65" filter in Safari)
+  // { store: "olx", url: "PASTE_OLX_FILTERED_SEARCH_URL" },
+];
 
   const offers = [];
   for (const t of targets) {
