@@ -13,11 +13,12 @@ if (request.method === "OPTIONS") {
   });
 }
     if (url.pathname === "/") {
-      return new Response(
-        "OK. Use /cheapest (JSON), /run (manual), /api/search?q=... (search).",
-        { headers: { "content-type": "text/plain; charset=utf-8" } }
-      );
-    }
+     return new Response(JSON.stringify(result, null, 2), {
+  headers: {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+  },
+});
 
     // Manual run (useful for testing from phone)
     if (url.pathname === "/run") {
