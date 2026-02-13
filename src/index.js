@@ -387,8 +387,6 @@ function titleFromPricyPath(pathname) {
   for (const it of items) {
     const prev = bestByLink.get(it.link);
     if (!prev || it.priceRON < prev.priceRON) bestByLink.set(it.link, it);
-  }
-
   const out = [...bestByLink.values()].sort((a, b) => a.priceRON - b.priceRON).slice(0, 10);
   return { queryUrl, items: out };
   
