@@ -3,346 +3,356 @@ export default {
     const url = new URL(request.url);
 
     // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-methods": "GET,POST,OPTIONS",
-          "access-control-allow-headers": "content-type",
-          "access-control-max-age": "86400",
-        },
-      });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
 
     if (url.pathname === "/") {
       return new Response(
-        "OK. Use /cheapest (JSON), /run (manual), /api/search?q=... (search).",
+        "OK. Use /api/search?q=...&budget=4000&sizeMin=55&sizeMax=65&condition=any&targets=<url>|<url>",
         { headers: { "content-type": "text/plain; charset=utf-8" } }
       );
     }
 
-    if (url.pathname === "/run") {
-      await runJob(env);
-      return new Response("ran", { status: 200 });
-    }
-
-    if (url.pathname === "/cheapest") {
-      const id = env.DB.idFromName("main");
-      const stub = env.DB.get(id);
-      const data = await stub.fetch("https://do.local/get").then((r) => r.json());
-      return new Response(JSON.stringify(data, null, 2), {
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "access-control-allow-origin": "*",
-        },
-      });
-    }
-
     if (url.pathname === "/api/search") {
-      const q = url.searchParams.get("q")?.trim();
-      if (!q) {
-        return new Response(JSON.stringify({ error: "missing q" }, null, 2), {
-          status: 400,
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "access-control-allow-origin": "*",
-          },
-        });
-      }
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) return json({ error: "missing q" }, 400);
 
-      const result = await searchAll(env, q);
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "access-control-allow-origin": "*",
-        },
+      const budget = numOrNull(url.searchParams.get("budget"));
+      const sizeMin = numOrNull(url.searchParams.get("sizeMin"));
+      const sizeMax = numOrNull(url.searchParams.get("sizeMax"));
+      const condition = (url.searchParams.get("condition") || "any").trim(); // any|new|used|resealed
+
+      // User-provided listing/search URLs for used marketplaces (OLX, etc.)
+      // You control these URLs so scraping stays low-volume + predictable.
+      const targetsRaw = (url.searchParams.get("targets") || "").trim();
+      const targets = targetsRaw
+        ? targetsRaw.split("|").map((s) => s.trim()).filter(Boolean).slice(0, 8)
+        : [];
+
+      const result = await runSearchPipeline(env, {
+        q,
+        budget,
+        sizeMin,
+        sizeMax,
+        condition,
+        targets,
       });
+
+      return json(result, 200);
     }
 
-    return new Response("Not found", { status: 404 });
-  },
-
-  async scheduled(controller, env, ctx) {
-    ctx.waitUntil(runJob(env));
+    return new Response("Not found", { status: 404, headers: corsHeaders() });
   },
 };
 
-/* -----------------------------
-   PART A: cheapest scraper
-   ----------------------------- */
+/* =========================
+   Helpers
+========================= */
 
-async function runJob(env) {
-  const targets = [
-    {
-      store: "altex",
-      url: "https://altex.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/",
-    },
-    {
-      store: "emag",
-      url: "https://www.emag.ro/televizor-lg-oled-evo-65g53ls-164-cm-smart-4k-ultra-hd-100-hz-clasa-e-model-2025-oled65g53ls/pd/DSMLL73BM/",
-    },
-    {
-      store: "mediagalaxy",
-      url: "https://mediagalaxy.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/",
-    },
-  ];
-
-  const offers = [];
-  const debug = { tried: 0, ok: 0, failed: 0, errors: [] };
-
-  for (const t of targets) {
-    debug.tried++;
-    try {
-      const resp = await fetch(t.url, {
-        headers: {
-          "user-agent": "Mozilla/5.0 price-hunter/1.0",
-          "accept-language": "ro-RO,ro;q=0.9,en;q=0.8",
-        },
-      });
-
-      if (!resp.ok) {
-        debug.failed++;
-        debug.errors.push({ store: t.store, reason: "http_" + resp.status });
-        continue;
-      }
-
-      const html = await resp.text();
-
-      const jsonLd = extractJsonLd(html);
-      let offer = pickOfferFromJsonLd(jsonLd);
-
-      if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
-      if (!offer?.price) offer = pickPriceFromPatterns(html) || offer;
-
-      if (!offer?.price) {
-        debug.failed++;
-        debug.errors.push({ store: t.store, reason: "no_price_found" });
-        continue;
-      }
-
-      debug.ok++;
-
-      const title = offer.title || offer.name || "";
-      const priceRON = toNumberRON(offer.price);
-
-      const base = {
-        store: t.store,
-        url: t.url,
-        title: title || null,
-        priceRON,
-        currency: offer.currency || "RON",
-        ts: new Date().toISOString(),
-        build: "gemini-safe-v2",
-      };
-
-      try {
-        const ck = stableKeyFromTitle(title);
-
-        let norm = await getCachedNorm(env, ck);
-        if (!norm) {
-          norm = await geminiNormalizeTitle(env, title);
-          if (norm) await putCachedNorm(env, ck, norm);
-        }
-
-        base.canonical = norm?.canonical_name ?? null;
-        base.productKey = norm?.product_key ?? null;
-        base.brand = norm?.brand ?? null;
-        base.modelFamily = norm?.model_family ?? null;
-        base.modelCode = norm?.model_code ?? null;
-        base.sizeInch = norm?.size_inch ?? null;
-      } catch (e) {
-        base.geminiError = String(e?.message || e);
-      }
-
-      offers.push(base);
-    } catch (e) {
-      debug.failed++;
-      debug.errors.push({ store: t.store, reason: String(e?.message || e) });
-    }
-  }
-
-  offers.sort((a, b) => a.priceRON - b.priceRON);
-
-  const payload = {
-    offers,
-    updatedAt: new Date().toISOString(),
-    debug,
+function corsHeaders() {
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400",
   };
+}
 
-  const id = env.DB.idFromName("main");
-  const stub = env.DB.get(id);
-
-  await stub.fetch("https://do.local/put", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", ...corsHeaders() },
   });
 }
 
-function extractJsonLd(html) {
-  const out = [];
-  const re =
-    /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
-  let m;
-  while ((m = re.exec(html))) {
-    const raw = m[1].trim();
-    try {
-      out.push(JSON.parse(raw));
-    } catch {}
-  }
-  return out;
+function numOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(String(v).replace(",", "."));
+  return Number.isFinite(n) ? n : null;
 }
 
-function pickOfferFromJsonLd(arr) {
-  for (const obj of arr) {
-    const list = Array.isArray(obj) ? obj : [obj];
-    for (const node of list) {
-      const type = node?.["@type"];
-      const isProduct =
-        type === "Product" || (Array.isArray(type) && type.includes("Product"));
-      if (!isProduct) continue;
-
-      const name = node?.name;
-      const offers = node?.offers;
-      const offer = Array.isArray(offers) ? offers[0] : offers;
-
-      const price = offer?.price ?? offer?.lowPrice;
-      const currency = offer?.priceCurrency;
-
-      if (price != null) return { title: name, price, currency };
-    }
+async function fetchWithTimeout(url, opts = {}, ms = 9000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(t);
   }
-  return null;
 }
 
-function pickPriceFromMeta(html) {
-  const m = html.match(
-    /property="(?:og:price:amount|product:price:amount)"\s+content="([\d.]+)"/i
+function normalizeText(s) {
+  return (s || "").replace(/\s+/g, " ").trim();
+}
+
+function looksBadCondition(text) {
+  const t = (text || "").toLowerCase();
+  const bad = [
+    "nu porneste",
+    "nu pornește",
+    "spart",
+    "crapat",
+    "crăpat",
+    "screen broken",
+    "display broken",
+    "ecran spart",
+    "defect",
+    "piese",
+    "pentru piese",
+  ];
+  return bad.some((k) => t.includes(k));
+}
+
+function looksLikeAccessory(title) {
+  const t = (title || "").toLowerCase();
+  return [
+    "husa",
+    "husă",
+    "case",
+    "cover",
+    "folie",
+    "screen protector",
+    "stand",
+    "suport",
+    "curea",
+    "charger",
+    "incarcator",
+    "încărcător",
+    "cablu",
+    "remote",
+    "telecomanda",
+  ].some((k) => t.includes(k));
+}
+
+function clamp(v, a, b) {
+  return Math.max(a, Math.min(b, v));
+}
+
+/* =========================
+   Browser Rendering REST fallback (optional)
+   - Uses /browser-rendering/content endpoint
+   - Requires CF_ACCOUNT_ID + CF_BR_API_TOKEN
+   Docs: /content endpoint, POST with {"url": "..."} and optional gotoOptions.waitUntil.  [oai_citation:2‡Cloudflare Docs](https://developers.cloudflare.com/browser-rendering/rest-api/content-endpoint/)
+========================= */
+
+async function brFetchRenderedHtml(env, pageUrl) {
+  if (!env.CF_ACCOUNT_ID || !env.CF_BR_API_TOKEN) return null;
+
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/browser-rendering/content`;
+  const body = {
+    url: pageUrl,
+    gotoOptions: { waitUntil: "networkidle0" },
+    // small speedups
+    rejectResourceTypes: ["image", "font"],
+    userAgent: "Mozilla/5.0 (compatible; price-hunter/1.0; +https://example.invalid)",
+  };
+
+  const resp = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.CF_BR_API_TOKEN}`,
+      },
+      body: JSON.stringify(body),
+    },
+    25000
   );
-  if (m) return { title: null, price: m[1], currency: "RON" };
-  return null;
+
+  if (!resp.ok) return null;
+
+  // Cloudflare REST returns a JSON envelope; handle both common shapes
+  const data = await resp.json().catch(() => null);
+  const html =
+    data?.result?.content ||
+    data?.result?.html ||
+    data?.content ||
+    data?.html ||
+    null;
+
+  return typeof html === "string" && html.length > 50 ? html : null;
 }
 
-function pickPriceFromPatterns(html) {
-  const m = html.match(/"price"\s*:\s*"?(?<p>\d+(?:[.,]\d+)?)"?/i);
-  if (m?.groups?.p) {
-    const p = m.groups.p.replace(",", ".");
-    return { title: null, price: p, currency: "RON" };
-  }
-  return null;
-}
+/* =========================
+   Pipeline
+========================= */
 
-function toNumberRON(p) {
-  if (p == null) return NaN;
-  const s = String(p).trim().replace(",", ".");
-  const n = Number(s);
-  return Number.isFinite(n) ? n : NaN;
-}
+async function runSearchPipeline(env, input) {
+  const startedAt = new Date().toISOString();
 
-/* -----------------------------
-   PART B: /api/search
-   ----------------------------- */
+  // 1) Gemini intent extraction from user query + constraints
+  const intent = await geminiIntent(env, input);
 
-async function searchAll(env, q) {
-  const debug = { q, steps: [], errors: [] };
-
-  const [pricy, mobilissimo] = await Promise.all([
-    searchPricy(q).catch((e) => ({ error: String(e?.message || e), items: [] })),
-    fetchMobilissimoRss(q).catch((e) => ({ error: String(e?.message || e), items: [] })),
+  // 2) Collect candidates from sources (low volume)
+  const [pricy, reselecto, targetListings] = await Promise.all([
+    searchPricy(intent.search_query || input.q).catch((e) => ({ error: String(e?.message || e), items: [] })),
+    searchReselecto(intent.search_query || input.q).catch((e) => ({ error: String(e?.message || e), items: [] })),
+    searchFromUserTargets(env, input.targets).catch((e) => ({ error: String(e?.message || e), items: [] })),
   ]);
 
-  debug.steps.push({
-    name: "pricy",
-    ok: !pricy.error,
-    count: pricy.items?.length ?? 0,
-    error: pricy.error ?? null,
+  // 3) Basic filtering
+  let candidates = [
+    ...(pricy.items || []).map((x) => ({ ...x, source: "pricy" })),
+    ...(reselecto.items || []).map((x) => ({ ...x, source: "reselecto" })),
+    ...(targetListings.items || []).map((x) => ({ ...x, source: "target" })),
+  ];
+
+  candidates = candidates
+    .filter((c) => c?.link && (c.title || c.snippet || c.rawText))
+    .filter((c) => {
+      // If user wants device, drop obvious accessories
+      if (intent?.category && intent.category !== "accessory") {
+        if (looksLikeAccessory(c.title)) return false;
+      }
+      return true;
+    })
+    .filter((c) => {
+      // Hard reject “broken/not working” style listings
+      const blob = `${c.title || ""} ${c.snippet || ""} ${c.rawText || ""}`;
+      return !looksBadCondition(blob);
+    });
+
+  // 4) Enrich used/resale candidates: extract condition, defects, negotiable, warranty from text
+  //    (Gemini runs on top N only to control cost)
+  const topForExtraction = candidates.slice(0, 12);
+  const extracted = await geminiExtractListingFacts(env, topForExtraction, intent);
+
+  // merge extraction back
+  const byLink = new Map(extracted.map((x) => [x.link, x]));
+  candidates = candidates.map((c) => ({ ...c, ...(byLink.get(c.link) || {}) }));
+
+  // 5) Score closeness/value with Gemini + deterministic constraints
+  const scored = await geminiScoreCandidates(env, candidates.slice(0, 20), intent);
+
+  // 6) Budget/size constraint pass
+  const finalRanked = (scored.items || [])
+    .map((it) => ({
+      ...it,
+      hardFit: hardFitScore(it, intent),
+    }))
+    .sort((a, b) => {
+      // primary: overall score, secondary: value score, tertiary: price
+      if ((b.overallScore || 0) !== (a.overallScore || 0)) return (b.overallScore || 0) - (a.overallScore || 0);
+      if ((b.valueScore || 0) !== (a.valueScore || 0)) return (b.valueScore || 0) - (a.valueScore || 0);
+      return (a.priceRON || 1e18) - (b.priceRON || 1e18);
+    })
+    .slice(0, 10);
+
+  // 7) Reviews: Google CSE query per top models, then Gemini summarizes pros/cons
+  const reviewPack = await fetchReviewsForTop(env, finalRanked, intent);
+
+  // 8) Final Gemini answer: differences + pros/cons + “best for money”
+  const recommendation = await geminiFinalRecommendation(env, {
+    input,
+    intent,
+    candidates: finalRanked,
+    reviews: reviewPack,
   });
-
-  debug.steps.push({
-    name: "mobilissimo_rss",
-    ok: !mobilissimo.error,
-    count: mobilissimo.items?.length ?? 0,
-    error: mobilissimo.error ?? null,
-  });
-
-  const domains = new Set();
-  for (const it of pricy.items || []) {
-    try {
-      domains.add(new URL(it.link).hostname.replace(/^www\./, ""));
-    } catch {}
-  }
-
-  // Coupon scraping is noisy; keep it OFF until you implement a reliable parser.
-  const coupons = [...domains].slice(0, 5).map((d) => ({
-    domain: d,
-    items: [],
-    note: "Coupons disabled (need reliable parser).",
-  }));
-
-  const summary = await geminiSummarize(env, { q, pricy, mobilissimo, coupons });
 
   return {
-    q,
-    pricy,
-    mobilissimo,
-    coupons,
-    summary,
-    ts: new Date().toISOString(),
-    debug,
+    startedAt,
+    input,
+    intent,
+    sources: {
+      pricy: { ok: !pricy.error, count: pricy.items?.length || 0, error: pricy.error || null },
+      reselecto: { ok: !reselecto.error, count: reselecto.items?.length || 0, error: reselecto.error || null },
+      targets: { ok: !targetListings.error, count: targetListings.items?.length || 0, error: targetListings.error || null },
+    },
+    top: finalRanked,
+    reviews: reviewPack,
+    recommendation,
+    build: "price-hunter-v3",
   };
 }
 
-// --- Pricy scraper (improved: only real product links + better titles)
-async function searchPricy(q) {
-  const queryUrl = `https://www.pricy.ro/productsv2/magazin-storel.ro/generic-color-verde?q=${encodeURIComponent(
-    q
-  )}`;
+function hardFitScore(it, intent) {
+  let s = 0;
 
-  const resp = await fetch(queryUrl, {
-    headers: {
-      "user-agent": "Mozilla/5.0",
-      "accept-language": "ro-RO,ro;q=0.9",
-    },
+  // budget
+  if (intent?.budget_lei != null && it.priceRON != null) {
+    if (it.priceRON <= intent.budget_lei) s += 20;
+    else s -= clamp((it.priceRON - intent.budget_lei) / 50, 0, 30);
+  }
+
+  // size
+  if (intent?.size_min != null && it.sizeInch != null) {
+    if (it.sizeInch >= intent.size_min) s += 5;
+    else s -= 10;
+  }
+  if (intent?.size_max != null && it.sizeInch != null) {
+    if (it.sizeInch <= intent.size_max) s += 5;
+    else s -= 10;
+  }
+
+  // oled requirement
+  if ((intent?.must_have || []).some((x) => String(x).toLowerCase().includes("oled"))) {
+    const t = `${it.title || ""} ${it.canonical || ""}`.toLowerCase();
+    if (t.includes("oled")) s += 10;
+    else s -= 15;
+  }
+
+  // condition preference
+  if (intent?.condition_ok && it.condition) {
+    if (intent.condition_ok.includes(it.condition)) s += 5;
+  }
+
+  // defects
+  if (it.defects?.length) s -= clamp(it.defects.length * 5, 0, 20);
+
+  return s;
+}
+
+/* =========================
+   Source: Pricy
+========================= */
+
+async function searchPricy(q) {
+  const queryUrl = `https://www.pricy.ro/productsv2/magazin-storel.ro/generic-color-verde?q=${encodeURIComponent(q)}`;
+  const resp = await fetchWithTimeout(queryUrl, {
+    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
   });
 
   if (!resp.ok) return { error: `pricy_http_${resp.status}`, queryUrl, items: [] };
-
   const html = await resp.text();
 
   const items = [];
   const re = /href="([^"]+)"[\s\S]{0,500}?(\d[\d.\s]{2,})\s*lei/gi;
 
   let m;
-  while ((m = re.exec(html)) && items.length < 80) {
+  while ((m = re.exec(html)) && items.length < 120) {
     const hrefRaw = m[1] || "";
     const priceRON = parseInt(m[2].replace(/\s+/g, "").replace(/\./g, ""), 10);
     if (!Number.isFinite(priceRON) || priceRON <= 0) continue;
 
-    const link = hrefRaw.startsWith("http")
-      ? hrefRaw
-      : new URL(hrefRaw, "https://www.pricy.ro").toString();
+    const link = hrefRaw.startsWith("http") ? hrefRaw : new URL(hrefRaw, "https://www.pricy.ro").toString();
 
     const u = safeUrl(link);
     if (!u) continue;
-    if (u.hostname !== "www.pricy.ro" && u.hostname !== "pricy.ro") continue;
+    if (!["pricy.ro", "www.pricy.ro"].includes(u.hostname)) continue;
+
+    // keep only product pages
     if (!u.pathname.includes("/ProductUrlId/")) continue;
 
     const title = titleFromPricyPath(u.pathname);
 
-    items.push({ title, link: u.toString(), priceRON });
+    items.push({
+      title: title || null,
+      link: u.toString(),
+      priceRON,
+    });
   }
 
-  const bestByLink = new Map();
+  // dedupe
+  const best = new Map();
   for (const it of items) {
-    const prev = bestByLink.get(it.link);
-    if (!prev || it.priceRON < prev.priceRON) bestByLink.set(it.link, it);
+    const prev = best.get(it.link);
+    if (!prev || it.priceRON < prev.priceRON) best.set(it.link, it);
   }
 
-  const out = [...bestByLink.values()]
-    .sort((a, b) => a.priceRON - b.priceRON)
-    .slice(0, 10);
-
-  return { queryUrl, items: out };
+  return {
+    queryUrl,
+    items: [...best.values()].sort((a, b) => a.priceRON - b.priceRON).slice(0, 10),
+  };
 }
 
 function safeUrl(s) {
@@ -357,147 +367,234 @@ function titleFromPricyPath(pathname) {
   const parts = (pathname || "").split("/").filter(Boolean);
   const idx = parts.findIndex((p) => p === "ProductUrlId");
   if (idx === -1) return null;
-
   const slug = parts[idx + 2] || "";
   if (!slug) return null;
-
-  return decodeURIComponent(slug)
-    .replace(/[-_]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return decodeURIComponent(slug).replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// --- Mobilissimo RSS (filter by q)
-async function fetchMobilissimoRss(q) {
-  const feed = "http://feeds.feedburner.com/telefoane-mobilissimo";
-  const resp = await fetch(feed);
-  if (!resp.ok) return { error: `rss_http_${resp.status}`, items: [] };
+/* =========================
+   Source: Reselecto (heuristic)
+   - Uses normal fetch; if empty and BR configured, tries Browser Rendering /content.
+========================= */
 
-  const xml = await resp.text();
-  const rawItems = [...xml.matchAll(/<item>[\s\S]*?<\/item>/g)].slice(0, 40);
+async function searchReselecto(q) {
+  // Basic search URL. If site changes, swap with category + query.
+  const queryUrl = `https://www.reselecto.ro/?s=${encodeURIComponent(q)}&post_type=product`;
 
-  const items = rawItems
-    .map((x) => {
-      const b = x[0];
-      const title =
-        (b.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/) ||
-          b.match(/<title>([\s\S]*?)<\/title>/))?.[1]?.trim() || null;
-      const link = b.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() || null;
-      const pubDate = b.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1]?.trim() || null;
-      return { title, link, pubDate };
-    })
-    .filter((x) => {
-      if (!q) return true;
-      return (x.title || "").toLowerCase().includes(q.toLowerCase());
-    })
-    .slice(0, 10);
+  let html = null;
+
+  // Try plain fetch
+  const r1 = await fetchWithTimeout(queryUrl, {
+    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
+  });
+  if (r1.ok) html = await r1.text();
+
+  // If plain fetch yields too little, try Browser Rendering (optional)
+  if (!html || html.length < 2000) {
+    // Caller env passed in later; this function is called without env, so do nothing here.
+    // We keep it plain. If you want BR for reselecto, move env into this function signature.
+  }
+
+  if (!html) return { error: "reselecto_fetch_failed", queryUrl, items: [] };
+
+  // Heuristic WooCommerce product tiles:
+  // - product link
+  // - product title (often in <h2 class="woocommerce-loop-product__title">)
+  // - price in lei
+  const items = [];
+  const tileRe = /<a[^>]+href="([^"]+)"[^>]*>[\s\S]{0,800}?<h2[^>]*>([\s\S]*?)<\/h2>[\s\S]{0,800}?(\d[\d.\s]{2,})\s*lei/gi;
+
+  let m;
+  while ((m = tileRe.exec(html)) && items.length < 15) {
+    const link = m[1];
+    const title = stripHtml(m[2]);
+    const priceRON = parseInt(m[3].replace(/\s+/g, "").replace(/\./g, ""), 10);
+    if (!link || !Number.isFinite(priceRON)) continue;
+
+    items.push({
+      title: normalizeText(title),
+      link: link.startsWith("http") ? link : new URL(link, "https://www.reselecto.ro").toString(),
+      priceRON,
+      rawText: null,
+    });
+  }
+
+  return { queryUrl, items };
+}
+
+function stripHtml(s) {
+  return String(s || "").replace(/<[^>]+>/g, " ");
+}
+
+/* =========================
+   User targets (OLX / any marketplace)
+   - You provide the URL(s) via targets=... to avoid crawling.
+   - Fetch page HTML, pull top listing blocks heuristically.
+   - If empty and BR configured, try Browser Rendering /content.
+========================= */
+
+async function searchFromUserTargets(env, targets) {
+  const items = [];
+  const debug = [];
+
+  for (const t of (targets || []).slice(0, 8)) {
+    try {
+      let html = null;
+
+      const r1 = await fetchWithTimeout(t, {
+        headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
+      });
+
+      if (r1.ok) html = await r1.text();
+
+      // if looks like SPA/blocked and Browser Rendering is available
+      if ((!html || html.length < 1200) && env.CF_ACCOUNT_ID && env.CF_BR_API_TOKEN) {
+        const rendered = await brFetchRenderedHtml(env, t);
+        if (rendered) html = rendered;
+      }
+
+      if (!html) {
+        debug.push({ url: t, ok: false, reason: "no_html" });
+        continue;
+      }
+
+      // generic listing extraction:
+      // try to find anchors + nearby price in lei
+      const re = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]{0,200}?)<\/a>[\s\S]{0,500}?(\d[\d.\s]{2,})\s*lei/gi;
+      let m;
+      let local = 0;
+
+      while ((m = re.exec(html)) && local < 10) {
+        const href = m[1];
+        const title = normalizeText(stripHtml(m[2]));
+        const priceRON = parseInt(m[3].replace(/\s+/g, "").replace(/\./g, ""), 10);
+
+        if (!href || !title || !Number.isFinite(priceRON)) continue;
+
+        const link = href.startsWith("http") ? href : new URL(href, t).toString();
+
+        // Skip nav links
+        if (title.length < 12) continue;
+
+        items.push({
+          title,
+          link,
+          priceRON,
+          rawText: null,
+          snippet: null,
+        });
+
+        local++;
+      }
+
+      debug.push({ url: t, ok: true, extracted: local });
+    } catch (e) {
+      debug.push({ url: t, ok: false, reason: String(e?.message || e) });
+    }
+  }
+
+  // dedupe
+  const best = new Map();
+  for (const it of items) {
+    const prev = best.get(it.link);
+    if (!prev || (it.priceRON || 1e18) < (prev.priceRON || 1e18)) best.set(it.link, it);
+  }
+
+  return { debug, items: [...best.values()].sort((a, b) => (a.priceRON || 1e18) - (b.priceRON || 1e18)).slice(0, 12) };
+}
+
+/* =========================
+   Reviews: Google Custom Search JSON API
+========================= */
+
+async function googleCseSearch(env, query, num = 5) {
+  if (!env.GOOGLE_CSE_API_KEY || !env.GOOGLE_CSE_CX) return { error: "missing_google_cse_env", items: [] };
+
+  const api = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(
+    env.GOOGLE_CSE_API_KEY
+  )}&cx=${encodeURIComponent(env.GOOGLE_CSE_CX)}&q=${encodeURIComponent(query)}&num=${clamp(num, 1, 10)}&gl=ro&hl=ro`;
+
+  const resp = await fetchWithTimeout(api, {}, 9000);
+  if (!resp.ok) return { error: `google_http_${resp.status}`, items: [] };
+
+  const data = await resp.json();
+  const items = (data.items || []).map((it) => ({
+    title: it.title || null,
+    link: it.link || null,
+    snippet: it.snippet || null,
+  }));
 
   return { items };
 }
 
-// --- Gemini summary for search results
-async function geminiSummarize(env, payload) {
+async function fetchReviewsForTop(env, ranked, intent) {
+  const top = (ranked || []).slice(0, 3);
+
+  const out = [];
+  for (const it of top) {
+    const model = it.modelCode || it.productKey || it.canonical || it.title || "";
+    const base = normalizeText(model).slice(0, 120);
+
+    const queries = [
+      `${base} review`,
+      `${base} site:rtings.com`,
+      `${base} site:reddit.com ${intent?.category || "review"}`,
+      `${base} site:avsforum.com`,
+    ];
+
+    const links = [];
+    for (const q of queries.slice(0, 3)) {
+      const res = await googleCseSearch(env, q, 5);
+      for (const li of res.items || []) {
+        if (li.link) links.push(li);
+      }
+    }
+
+    // dedupe links
+    const seen = new Set();
+    const uniq = [];
+    for (const l of links) {
+      if (!l.link || seen.has(l.link)) continue;
+      seen.add(l.link);
+      uniq.push(l);
+      if (uniq.length >= 12) break;
+    }
+
+    out.push({ link: it.link, model: base, sources: uniq });
+  }
+
+  return out;
+}
+
+/* =========================
+   Gemini calls
+========================= */
+
+async function geminiCallJson(env, prompt, temperature = 0) {
   if (!env.GEMINI_API_KEY) return null;
 
   const endpoint =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-  const prompt =
-    `You are a price assistant for Romania.
-Given JSON results, produce:
-1) Cheapest 3 offers (price + link)
-2) Any relevant Mobilissimo items (max 3)
-3) Coupons by domain (if any)
-Keep it concise.
-JSON:
-${JSON.stringify(payload)}`;
-
   const body = {
     contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.2 },
+    generationConfig: { temperature, responseMimeType: "application/json" },
   };
 
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-goog-api-key": env.GEMINI_API_KEY,
+  const resp = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    12000
+  );
 
   if (!resp.ok) return null;
 
   const data = await resp.json();
-  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? null;
-}
-
-/* -----------------------------
-   Gemini normalization cache (DO)
-   ----------------------------- */
-
-function stableKeyFromTitle(title) {
-  return (title || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^a-z0-9" ]/g, "")
-    .trim()
-    .slice(0, 180);
-}
-
-async function getCachedNorm(env, cacheKey) {
-  const id = env.DB.idFromName("main");
-  const stub = env.DB.get(id);
-  return stub
-    .fetch("https://do.local/norm-get?k=" + encodeURIComponent(cacheKey))
-    .then((r) => r.json());
-}
-
-async function putCachedNorm(env, cacheKey, value) {
-  const id = env.DB.idFromName("main");
-  const stub = env.DB.get(id);
-  return stub.fetch("https://do.local/norm-put", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ key: cacheKey, value }),
-  });
-}
-
-async function geminiNormalizeTitle(env, title) {
-  if (!env.GEMINI_API_KEY || !title) return null;
-
-  const endpoint =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-  const prompt = `Extract product identity from this Romanian e-commerce title.
-Return ONLY JSON with keys:
-brand, model_family, model_code, size_inch, canonical_name, product_key.
-Title: ${title}`;
-
-  const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: "application/json",
-    },
-  };
-
-  const resp = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-goog-api-key": env.GEMINI_API_KEY,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) return null;
-
-  const data = await resp.json();
-  const text =
-    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
-  if (!text) return null;
-
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
   try {
     return JSON.parse(text);
   } catch {
@@ -505,46 +602,153 @@ Title: ${title}`;
   }
 }
 
-/* -----------------------------
-   Durable Object storage
-   ----------------------------- */
+async function geminiCallText(env, prompt, temperature = 0.2) {
+  if (!env.GEMINI_API_KEY) return null;
 
-export class DB {
-  constructor(state, env) {
-    this.state = state;
-  }
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-  async fetch(request) {
-    const url = new URL(request.url);
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature },
+  };
 
-    if (url.pathname === "/norm-get") {
-      const key = url.searchParams.get("k");
-      const v = key ? await this.state.storage.get("norm:" + key) : null;
-      return new Response(JSON.stringify(v || null), {
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-    }
+  const resp = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+      body: JSON.stringify(body),
+    },
+    12000
+  );
 
-    if (url.pathname === "/norm-put") {
-      const { key, value } = await request.json();
-      if (key) await this.state.storage.put("norm:" + key, value);
-      return new Response("ok");
-    }
+  if (!resp.ok) return null;
 
-    if (url.pathname === "/put") {
-      const body = await request.json();
-      await this.state.storage.put("data", body);
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/get") {
-      const data =
-        (await this.state.storage.get("data")) || { offers: [], updatedAt: null };
-      return new Response(JSON.stringify(data), {
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-    }
-
-    return new Response("not found", { status: 404 });
-  }
+  const data = await resp.json();
+  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? null;
 }
+
+async function geminiIntent(env, input) {
+  const prompt = `
+Return ONLY JSON:
+{
+  "category": "tv|laptop|phone|audio|other",
+  "budget_lei": number|null,
+  "size_min": number|null,
+  "size_max": number|null,
+  "condition_ok": ["new","resealed","used"],
+  "must_have": ["..."],
+  "must_exclude": ["..."],
+  "search_query": "string",
+  "expanded_queries": ["...", "...", "..."]
+}
+
+User query: ${input.q}
+Constraints:
+- budget: ${input.budget ?? null}
+- sizeMin: ${input.sizeMin ?? null}
+- sizeMax: ${input.sizeMax ?? null}
+- condition: ${input.condition}
+
+Interpretation rules:
+- If query mentions OLED, include "oled" in must_have.
+- If user allows resealed/used, include them in condition_ok.
+- must_exclude should include broken/non-working indications.
+- search_query should be the best short query for price search in Romania.
+`;
+
+  const data = await geminiCallJson(env, prompt, 0);
+  // deterministic fallback
+  return (
+    data || {
+      category: "other",
+      budget_lei: input.budget ?? null,
+      size_min: input.sizeMin ?? null,
+      size_max: input.sizeMax ?? null,
+      condition_ok: ["new", "resealed", "used"],
+      must_have: [],
+      must_exclude: ["nu porneste", "ecran spart", "pentru piese"],
+      search_query: input.q,
+      expanded_queries: [],
+    }
+  );
+}
+
+async function geminiExtractListingFacts(env, items, intent) {
+  const prompt = `
+You receive marketplace results. Extract defects/negotiable/condition and size if present.
+Return ONLY JSON: { "items": [ { "link": "...", "condition": "new|used|resealed|unknown", "negotiable": true|false|unknown, "defects": ["..."], "sizeInch": number|null, "notes": "..." } ] }
+
+Context: user wants category=${intent?.category}, must_have=${JSON.stringify(intent?.must_have || [])}, must_exclude=${JSON.stringify(intent?.must_exclude || [])}
+
+Items:
+${JSON.stringify(
+    (items || []).map((x) => ({
+      title: x.title,
+      link: x.link,
+      priceRON: x.priceRON,
+      snippet: x.snippet,
+      rawText: x.rawText,
+    }))
+  )}
+`;
+
+  const res = await geminiCallJson(env, prompt, 0);
+  return res?.items || [];
+}
+
+async function geminiScoreCandidates(env, items, intent) {
+  const prompt = `
+Return ONLY JSON:
+{
+  "items": [
+    {
+      "link": "...",
+      "title": "...",
+      "priceRON": number|null,
+      "overallScore": number,        // 0-100 closeness to request
+      "valueScore": number,          // 0-100 price/performance for budget
+      "differences": ["..."],        // differences vs requested constraints
+      "pros": ["..."],
+      "cons": ["..."],
+      "modelCode": "string|null",
+      "sizeInch": number|null,
+      "panelType": "oled|qled|lcd|unknown",
+      "condition": "new|used|resealed|unknown",
+      "negotiable": true|false|unknown,
+      "defects": ["..."]
+    }
+  ]
+}
+
+User intent:
+${JSON.stringify(intent)}
+
+Candidates:
+${JSON.stringify(items)}
+`;
+
+  const res = await geminiCallJson(env, prompt, 0);
+  return res || { items: [] };
+}
+
+async function geminiFinalRecommendation(env, payload) {
+  const prompt = `
+You are a Romanian "best value for money" assistant.
+Given the JSON, produce:
+- Best pick under budget
+- Best overall value (may be slightly above budget)
+- Best used/resealed deal (if present)
+For each: short rationale + key differences vs request + risks/defects + whether negotiable.
+Then a final "buying checklist" (what to ask seller, what photos to request).
+
+JSON:
+${JSON.stringify(payload)}
+`;
+  return await geminiCallText(env, prompt, 0.2);
+}
+
+/* =========================
+   END
+========================= */
