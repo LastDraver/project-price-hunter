@@ -44,7 +44,23 @@ async function runJob(env) {
   // replace with your filtered OLX search URL (after you set 65" filter in Safari)
   // { store: "olx", url: "PASTE_OLX_FILTERED_SEARCH_URL" },
 ];
+function pickPriceFromMeta(html) {
+  // og:price:amount or product:price:amount
+  const m = html.match(/property="(?:og:price:amount|product:price:amount)"\s+content="([\d.]+)"/i);
+  if (m) return { title: null, price: m[1], currency: "RON" };
+  return null;
+}
 
+function pickPriceFromPatterns(html) {
+  // very rough fallback; improves coverage, may need tuning per site
+  // looks for "price" : 12345.67 or 12345
+  const m = html.match(/"price"\s*:\s*"?(?<p>\d+(?:[.,]\d+)?)"?/i);
+  if (m?.groups?.p) {
+    const p = m.groups.p.replace(",", ".");
+    return { title: null, price: p, currency: "RON" };
+  }
+  return null;
+}
   const offers = [];
   for (const t of targets) {
     try {
@@ -56,8 +72,13 @@ async function runJob(env) {
       }).then(r => r.text());
 
       const jsonLd = extractJsonLd(html);
-      const offer = pickOfferFromJsonLd(jsonLd);
+      let offer = pickOfferFromJsonLd(jsonLd);
 
+// fallback: try meta price
+if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
+
+// fallback: try common "price" patterns
+if (!offer?.price) offer = pickPriceFromPatterns(html) || offer;
       if (offer?.price != null) {
         offers.push({
           store: t.store,
