@@ -66,8 +66,9 @@ export default {
     ctx.waitUntil(runJob(env));
   },
 };
+
 /* -----------------------------
-   PART A: Your existing scraper
+   PART A: cheapest scraper
    ----------------------------- */
 
 async function runJob(env) {
@@ -134,7 +135,6 @@ async function runJob(env) {
         build: "gemini-safe-v2",
       };
 
-      // Gemini enrichment (must not block saving the offer)
       try {
         const ck = stableKeyFromTitle(title);
 
@@ -239,13 +239,9 @@ function toNumberRON(p) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-/* --------------------------------
-   PART B: Search API (/api/search)
-   - pricy.ro (scrape)
-   - mobilissimo RSS (read)
-   - coupons (promo-codes.ro basic)
-   - gemini summary (optional)
-   -------------------------------- */
+/* -----------------------------
+   PART B: /api/search
+   ----------------------------- */
 
 async function searchAll(env, q) {
   const debug = { q, steps: [], errors: [] };
@@ -269,7 +265,6 @@ async function searchAll(env, q) {
     error: mobilissimo.error ?? null,
   });
 
-  // derive domains from pricy item links
   const domains = new Set();
   for (const it of pricy.items || []) {
     try {
@@ -277,13 +272,13 @@ async function searchAll(env, q) {
     } catch {}
   }
 
-  // coupons (very basic: site search on promo-codes.ro)
-  const coupons = [];
-  for (const d of [...domains].slice(0, 5)) {
-    coupons.push(await fetchCouponsPromoCodes(d));
-  }
+  // Coupon scraping is noisy; keep it OFF until you implement a reliable parser.
+  const coupons = [...domains].slice(0, 5).map((d) => ({
+    domain: d,
+    items: [],
+    note: "Coupons disabled (need reliable parser).",
+  }));
 
-  // Gemini summary (optional)
   const summary = await geminiSummarize(env, { q, pricy, mobilissimo, coupons });
 
   return {
@@ -297,7 +292,6 @@ async function searchAll(env, q) {
   };
 }
 
-// --- Pricy scraper (heuristic; may need tuning)
 // --- Pricy scraper (improved: only real product links + better titles)
 async function searchPricy(q) {
   const queryUrl = `https://www.pricy.ro/productsv2/magazin-storel.ro/generic-color-verde?q=${encodeURIComponent(
@@ -324,28 +318,20 @@ async function searchPricy(q) {
     const priceRON = parseInt(m[2].replace(/\s+/g, "").replace(/\./g, ""), 10);
     if (!Number.isFinite(priceRON) || priceRON <= 0) continue;
 
-    // Normalize absolute link
     const link = hrefRaw.startsWith("http")
       ? hrefRaw
       : new URL(hrefRaw, "https://www.pricy.ro").toString();
 
-    // Keep ONLY product pages (Pricy uses /ProductUrlId/<id>/<slug>)
-    // This removes min-price/max-price links and other navigation pages.
     const u = safeUrl(link);
     if (!u) continue;
     if (u.hostname !== "www.pricy.ro" && u.hostname !== "pricy.ro") continue;
+    if (!u.pathname.includes("/ProductUrlId/")) continue;
 
-    const isProduct = u.pathname.includes("/ProductUrlId/");
-    if (!isProduct) continue;
-
-    // Extract title from URL slug (last path segment after id)
-    // Example: /ProductUrlId/12345/lg-oled-65g53ls
     const title = titleFromPricyPath(u.pathname);
 
     items.push({ title, link: u.toString(), priceRON });
   }
 
-  // Deduplicate by link, keep cheapest
   const bestByLink = new Map();
   for (const it of items) {
     const prev = bestByLink.get(it.link);
@@ -369,11 +355,9 @@ function safeUrl(s) {
 
 function titleFromPricyPath(pathname) {
   const parts = (pathname || "").split("/").filter(Boolean);
-  // find "ProductUrlId" index
   const idx = parts.findIndex((p) => p === "ProductUrlId");
   if (idx === -1) return null;
 
-  // expected: ["ProductUrlId", "<id>", "<slug...>"]
   const slug = parts[idx + 2] || "";
   if (!slug) return null;
 
@@ -382,14 +366,7 @@ function titleFromPricyPath(pathname) {
     .replace(/\s+/g, " ")
     .trim();
 }
-  // Deduplicate by link, keep cheapest
-  const bestByLink = new Map();
-  for (const it of items) {
-    const prev = bestByLink.get(it.link);
-    if (!prev || it.priceRON < prev.priceRON) bestByLink.set(it.link, it);
-  const out = [...bestByLink.values()].sort((a, b) => a.priceRON - b.priceRON).slice(0, 10);
-  return { queryUrl, items: out };
-  
+
 // --- Mobilissimo RSS (filter by q)
 async function fetchMobilissimoRss(q) {
   const feed = "http://feeds.feedburner.com/telefoane-mobilissimo";
@@ -418,32 +395,6 @@ async function fetchMobilissimoRss(q) {
   return { items };
 }
 
-// --- Coupons (basic; may need tuning to promo-codes.ro structure)
-async function fetchCouponsPromoCodes(domain) {
-  const searchUrl = `https://promo-codes.ro/?s=${encodeURIComponent(domain)}`;
-
-  const resp = await fetch(searchUrl, {
-    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
-  });
-
-  if (!resp.ok) return { domain, items: [], error: `coupon_http_${resp.status}`, searchUrl };
-
-  const html = await resp.text();
-
-  // Heuristic: detect coupon-like codes (A-Z0-9 4..14)
-  const items = [];
-  const codeRe = /\b([A-Z0-9]{4,14})\b/g;
-  let m;
-  while ((m = codeRe.exec(html)) && items.length < 8) {
-    const code = m[1];
-    // avoid capturing common noise tokens
-    if (["HTTP", "HTML", "COOKIE", "LOGIN", "ORDER"].includes(code)) continue;
-    items.push({ title: "Coupon", code, note: "source: promo-codes.ro" });
-  }
-
-  return { domain, items, searchUrl };
-}
-
 // --- Gemini summary for search results
 async function geminiSummarize(env, payload) {
   if (!env.GEMINI_API_KEY) return null;
@@ -452,11 +403,11 @@ async function geminiSummarize(env, payload) {
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
   const prompt =
-`You are a price assistant for Romania.
+    `You are a price assistant for Romania.
 Given JSON results, produce:
 1) Cheapest 3 offers (price + link)
 2) Any relevant Mobilissimo items (max 3)
-3) Coupons by domain
+3) Coupons by domain (if any)
 Keep it concise.
 JSON:
 ${JSON.stringify(payload)}`;
@@ -481,9 +432,9 @@ ${JSON.stringify(payload)}`;
   return data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? null;
 }
 
-/* --------------------------------
+/* -----------------------------
    Gemini normalization cache (DO)
-   -------------------------------- */
+   ----------------------------- */
 
 function stableKeyFromTitle(title) {
   return (title || "")
@@ -566,7 +517,6 @@ export class DB {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // normalization cache
     if (url.pathname === "/norm-get") {
       const key = url.searchParams.get("k");
       const v = key ? await this.state.storage.get("norm:" + key) : null;
@@ -581,7 +531,6 @@ export class DB {
       return new Response("ok");
     }
 
-    // cheapest payload storage
     if (url.pathname === "/put") {
       const body = await request.json();
       await this.state.storage.put("data", body);
