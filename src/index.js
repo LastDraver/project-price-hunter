@@ -748,7 +748,31 @@ ${JSON.stringify(payload)}
 `;
   return await geminiCallText(env, prompt, 0.2);
 }
+export class DB {
+  constructor(state, env) {
+    this.state = state;
+  }
 
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/put") {
+      const body = await request.json();
+      await this.state.storage.put("data", body);
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/get") {
+      const data =
+        (await this.state.storage.get("data")) || { offers: [], updatedAt: null };
+      return new Response(JSON.stringify(data), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+}
 /* =========================
    END
 ========================= */
