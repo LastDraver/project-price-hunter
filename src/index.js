@@ -260,12 +260,39 @@ async function runSearchPipeline(env, input, intent) {
   const reviews = await fetchReviewsForTop(env, ranked, intent);
 
   // 8) Final recommendation text
-  const recommendation = await geminiFinalRecommendation(env, {
+  let recommendation = null;
+try {
+  const rankedSmall = (ranked || []).slice(0, 5).map(x => ({
+    title: x.title,
+    link: x.link,
+    priceRON: x.priceRON,
+    condition: x.condition,
+    negotiable: x.negotiable,
+    defects: x.defects,
+    sizeInch: x.sizeInch,
+    panelType: x.panelType,
+    differences: x.differences,
+    pros: x.pros,
+    cons: x.cons,
+    overallScore: x.overallScore,
+    valueScore: x.valueScore,
+  }));
+
+  const reviewsSmall = (reviews?.items || []).slice(0, 3).map(r => ({
+    model: r.model,
+    sources: (r.sources || []).slice(0, 6).map(s => ({ title: s.title, link: s.link })),
+  }));
+
+  recommendation = await geminiFinalRecommendation(env, {
     input,
     intent,
-    ranked,
-    reviews,
+    ranked: rankedSmall,
+    reviews: { items: reviewsSmall },
   });
+} catch (e) {
+  recommendation = null;
+  debug.steps.push({ name: "final_recommendation_failed", error: String(e?.message || e) });
+}
 
   return {
     q: input.q,
