@@ -3,13 +3,12 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
-      return new Response(
-        "OK. Use /cheapest (JSON) or /run (manual).",
-        { headers: { "content-type": "text/plain; charset=utf-8" } }
-      );
+      return new Response("OK. Use /cheapest (JSON) or /run (manual).", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
 
-    // Manual run from phone (useful for testing)
+    // Manual run (useful for testing from phone)
     if (url.pathname === "/run") {
       await runJob(env);
       return new Response("ran", { status: 200 });
@@ -19,7 +18,7 @@ export default {
     if (url.pathname === "/cheapest") {
       const id = env.DB.idFromName("main");
       const stub = env.DB.get(id);
-      const data = await stub.fetch("https://do.local/get").then(r => r.json());
+      const data = await stub.fetch("https://do.local/get").then((r) => r.json());
       return new Response(JSON.stringify(data, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8" },
       });
@@ -34,82 +33,95 @@ export default {
 };
 
 async function runJob(env) {
-  // Put a SMALL allowlist here. Start with 5–20 URLs max.
-  // Tip: choose product pages that contain JSON-LD Product/Offer.
   const targets = [
-  { store: "altex", url: "https://altex.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/" },
-  { store: "emag", url: "https://www.emag.ro/televizor-lg-oled-evo-65g53ls-164-cm-smart-4k-ultra-hd-100-hz-clasa-e-model-2025-oled65g53ls/pd/DSMLL73BM/" },
-  { store: "mediagalaxy", url: "https://mediagalaxy.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/" },
+    {
+      store: "altex",
+      url: "https://altex.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/",
+    },
+    {
+      store: "emag",
+      url: "https://www.emag.ro/televizor-lg-oled-evo-65g53ls-164-cm-smart-4k-ultra-hd-100-hz-clasa-e-model-2025-oled65g53ls/pd/DSMLL73BM/",
+    },
+    {
+      store: "mediagalaxy",
+      url: "https://mediagalaxy.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/",
+    },
+    // Add OLX later with a filtered search URL + dedicated extractor
+  ];
 
-  // replace with your filtered OLX search URL (after you set 65" filter in Safari)
-  // { store: "olx", url: "PASTE_OLX_FILTERED_SEARCH_URL" },
-];
-function pickPriceFromMeta(html) {
-  // og:price:amount or product:price:amount
-  const m = html.match(/property="(?:og:price:amount|product:price:amount)"\s+content="([\d.]+)"/i);
-  if (m) return { title: null, price: m[1], currency: "RON" };
-  return null;
-}
-
-function pickPriceFromPatterns(html) {
-  // very rough fallback; improves coverage, may need tuning per site
-  // looks for "price" : 12345.67 or 12345
-  const m = html.match(/"price"\s*:\s*"?(?<p>\d+(?:[.,]\d+)?)"?/i);
-  if (m?.groups?.p) {
-    const p = m.groups.p.replace(",", ".");
-    return { title: null, price: p, currency: "RON" };
-  }
-  return null;
-}
   const offers = [];
+  const debug = { tried: 0, ok: 0, failed: 0, errors: [] };
+
   for (const t of targets) {
+    debug.tried++;
     try {
-      const html = await fetch(t.url, {
+      const resp = await fetch(t.url, {
         headers: {
           "user-agent": "Mozilla/5.0 price-hunter/1.0",
           "accept-language": "ro-RO,ro;q=0.9,en;q=0.8",
         },
-      }).then(r => r.text());
+      });
+
+      if (!resp.ok) {
+        debug.failed++;
+        debug.errors.push({ store: t.store, reason: "http_" + resp.status });
+        continue;
+      }
+
+      const html = await resp.text();
 
       const jsonLd = extractJsonLd(html);
       let offer = pickOfferFromJsonLd(jsonLd);
 
-// fallback: try meta price
-if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
+      // Fallbacks if JSON-LD isn't enough
+      if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
+      if (!offer?.price) offer = pickPriceFromPatterns(html) || offer;
 
-// fallback: try common "price" patterns
-if (offer?.price != null) {
-  const title = offer.title || offer.name || "";
-  const ck = stableKeyFromTitle(title);
+      if (!offer?.price) {
+        debug.failed++;
+        debug.errors.push({ store: t.store, reason: "no_price_found" });
+        continue;
+      }
 
-  let norm = await getCachedNorm(env, ck);
-  if (!norm) {
-    norm = await geminiNormalizeTitle(env, title);
-    if (norm) await putCachedNorm(env, ck, norm);
-  }
+      debug.ok++;
 
-  offers.push({
-    store: t.store,
-    url: t.url,
-    title: title || null,
-    priceRON: Number(offer.price),
-    currency: offer.currency || "RON",
-    ts: new Date().toISOString(),
+      const title = offer.title || offer.name || "";
+      const priceRON = toNumberRON(offer.price);
 
-    // Gemini enrichment:
-    canonical: norm?.canonical_name ?? null,
-    productKey: norm?.product_key ?? null,
-    brand: norm?.brand ?? null,
-    modelFamily: norm?.model_family ?? null,
-    modelCode: norm?.model_code ?? null,
-    sizeInch: norm?.size_inch ?? null,
+      const base = {
+        store: t.store,
+        url: t.url,
+        title: title || null,
+        priceRON,
+        currency: offer.currency || "RON",
+        ts: new Date().toISOString(),
+        build: "gemini-safe-v2",
+      };
 
-    // Debug marker to confirm new code is running:
-    build: "gemini-cache-v1",
-  });
-}
+      // Gemini enrichment (must not block saving the offer)
+      try {
+        const ck = stableKeyFromTitle(title);
+
+        let norm = await getCachedNorm(env, ck);
+        if (!norm) {
+          norm = await geminiNormalizeTitle(env, title);
+          if (norm) await putCachedNorm(env, ck, norm);
+        }
+
+        base.canonical = norm?.canonical_name ?? null;
+        base.productKey = norm?.product_key ?? null;
+        base.brand = norm?.brand ?? null;
+        base.modelFamily = norm?.model_family ?? null;
+        base.modelCode = norm?.model_code ?? null;
+        base.sizeInch = norm?.size_inch ?? null;
+      } catch (e) {
+        base.geminiError = String(e?.message || e);
+      }
+
+      offers.push(base);
     } catch (e) {
-      // ignore target errors; don't fail the whole run
+      debug.failed++;
+      debug.errors.push({ store: t.store, reason: String(e?.message || e) });
     }
   }
 
@@ -118,23 +130,23 @@ if (offer?.price != null) {
   const payload = {
     offers,
     updatedAt: new Date().toISOString(),
+    debug,
   };
 
   const id = env.DB.idFromName("main");
   const stub = env.DB.get(id);
+
   await stub.fetch("https://do.local/put", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  // Optional: call Gemini here later for matching/normalization
-  // but do NOT do it until extraction works and you have stable data.
 }
 
 function extractJsonLd(html) {
   const out = [];
-  const re = /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
+  const re =
+    /<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi;
   let m;
   while ((m = re.exec(html))) {
     const raw = m[1].trim();
@@ -144,6 +156,53 @@ function extractJsonLd(html) {
   }
   return out;
 }
+
+function pickOfferFromJsonLd(arr) {
+  for (const obj of arr) {
+    const list = Array.isArray(obj) ? obj : [obj];
+    for (const node of list) {
+      const type = node?.["@type"];
+      const isProduct =
+        type === "Product" || (Array.isArray(type) && type.includes("Product"));
+      if (!isProduct) continue;
+
+      const name = node?.name;
+      const offers = node?.offers;
+      const offer = Array.isArray(offers) ? offers[0] : offers;
+
+      const price = offer?.price ?? offer?.lowPrice;
+      const currency = offer?.priceCurrency;
+
+      if (price != null) return { title: name, price, currency };
+    }
+  }
+  return null;
+}
+
+function pickPriceFromMeta(html) {
+  const m = html.match(
+    /property="(?:og:price:amount|product:price:amount)"\s+content="([\d.]+)"/i
+  );
+  if (m) return { title: null, price: m[1], currency: "RON" };
+  return null;
+}
+
+function pickPriceFromPatterns(html) {
+  const m = html.match(/"price"\s*:\s*"?(?<p>\d+(?:[.,]\d+)?)"?/i);
+  if (m?.groups?.p) {
+    const p = m.groups.p.replace(",", ".");
+    return { title: null, price: p, currency: "RON" };
+  }
+  return null;
+}
+
+function toNumberRON(p) {
+  if (p == null) return NaN;
+  const s = String(p).trim().replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function stableKeyFromTitle(title) {
   return (title || "")
     .toLowerCase()
@@ -156,7 +215,9 @@ function stableKeyFromTitle(title) {
 async function getCachedNorm(env, cacheKey) {
   const id = env.DB.idFromName("main");
   const stub = env.DB.get(id);
-  return stub.fetch("https://do.local/norm-get?k=" + encodeURIComponent(cacheKey)).then(r => r.json());
+  return stub
+    .fetch("https://do.local/norm-get?k=" + encodeURIComponent(cacheKey))
+    .then((r) => r.json());
 }
 
 async function putCachedNorm(env, cacheKey, value) {
@@ -175,78 +236,65 @@ async function geminiNormalizeTitle(env, title) {
   const endpoint =
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
-  const prompt =
-`Extract product identity from this Romanian e-commerce title.
-Return ONLY JSON with keys: brand, model_family, model_code, size_inch, canonical_name, product_key.
+  const prompt = `Extract product identity from this Romanian e-commerce title.
+Return ONLY JSON with keys:
+brand, model_family, model_code, size_inch, canonical_name, product_key.
 Title: ${title}`;
 
   const body = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
       temperature: 0,
-      responseMimeType: "application/json"
-    }
+      responseMimeType: "application/json",
+    },
   };
 
   const resp = await fetch(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-goog-api-key": env.GEMINI_API_KEY
+      "x-goog-api-key": env.GEMINI_API_KEY,
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   if (!resp.ok) return null;
 
   const data = await resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ?? "";
+  const text =
+    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? "";
   if (!text) return null;
 
-  try { return JSON.parse(text); } catch { return null; }
-}
-function pickOfferFromJsonLd(arr) {
-  // Loose heuristic: find Product -> offers -> price
-  for (const obj of arr) {
-    const list = Array.isArray(obj) ? obj : [obj];
-    for (const node of list) {
-      const type = node?.["@type"];
-      const isProduct = type === "Product" || (Array.isArray(type) && type.includes("Product"));
-      if (!isProduct) continue;
-
-      const name = node?.name;
-      const offers = node?.offers;
-      const offer = Array.isArray(offers) ? offers[0] : offers;
-
-      const price = offer?.price ?? offer?.lowPrice;
-      const currency = offer?.priceCurrency;
-
-      if (price != null) return { title: name, price, currency };
-    }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
-  return null;
 }
 
-// Durable Object for storage
+// Durable Object for storage + normalization cache
 export class DB {
   constructor(state, env) {
     this.state = state;
   }
+
   async fetch(request) {
     const url = new URL(request.url);
-if (url.pathname === "/norm-get") {
-  const key = url.searchParams.get("k");
-  const v = key ? await this.state.storage.get("norm:" + key) : null;
-  return new Response(JSON.stringify(v || null), {
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-}
 
-if (url.pathname === "/norm-put") {
-  const { key, value } = await request.json();
-  if (key) await this.state.storage.put("norm:" + key, value);
-  return new Response("ok");
-}
+    if (url.pathname === "/norm-get") {
+      const key = url.searchParams.get("k");
+      const v = key ? await this.state.storage.get("norm:" + key) : null;
+      return new Response(JSON.stringify(v || null), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname === "/norm-put") {
+      const { key, value } = await request.json();
+      if (key) await this.state.storage.put("norm:" + key, value);
+      return new Response("ok");
+    }
+
     if (url.pathname === "/put") {
       const body = await request.json();
       await this.state.storage.put("data", body);
@@ -254,7 +302,8 @@ if (url.pathname === "/norm-put") {
     }
 
     if (url.pathname === "/get") {
-      const data = (await this.state.storage.get("data")) || { offers: [], updatedAt: null };
+      const data =
+        (await this.state.storage.get("data")) || { offers: [], updatedAt: null };
       return new Response(JSON.stringify(data), {
         headers: { "content-type": "application/json; charset=utf-8" },
       });
