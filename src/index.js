@@ -391,8 +391,6 @@ function titleFromPricyPath(pathname) {
 
   const out = [...bestByLink.values()].sort((a, b) => a.priceRON - b.priceRON).slice(0, 10);
   return { queryUrl, items: out };
-}
-
 // --- Mobilissimo RSS (filter by q)
 async function fetchMobilissimoRss(q) {
   const feed = "http://feeds.feedburner.com/telefoane-mobilissimo";
