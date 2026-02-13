@@ -155,7 +155,19 @@ export class DB {
   }
   async fetch(request) {
     const url = new URL(request.url);
+if (url.pathname === "/norm-get") {
+  const key = url.searchParams.get("k");
+  const v = key ? await this.state.storage.get("norm:" + key) : null;
+  return new Response(JSON.stringify(v || null), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
 
+if (url.pathname === "/norm-put") {
+  const { key, value } = await request.json();
+  if (key) await this.state.storage.put("norm:" + key, value);
+  return new Response("ok");
+}
     if (url.pathname === "/put") {
       const body = await request.json();
       await this.state.storage.put("data", body);
