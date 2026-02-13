@@ -78,17 +78,36 @@ function pickPriceFromPatterns(html) {
 if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
 
 // fallback: try common "price" patterns
-if (!offer?.price) offer = pickPriceFromPatterns(html) || offer;
-      if (offer?.price != null) {
-        offers.push({
-          store: t.store,
-          url: t.url,
-          title: offer.title ?? null,
-          priceRON: Number(offer.price),
-          currency: offer.currency ?? "RON",
-          ts: new Date().toISOString(),
-        });
-      }
+if (offer?.price != null) {
+  const title = offer.title || offer.name || "";
+  const ck = stableKeyFromTitle(title);
+
+  let norm = await getCachedNorm(env, ck);
+  if (!norm) {
+    norm = await geminiNormalizeTitle(env, title);
+    if (norm) await putCachedNorm(env, ck, norm);
+  }
+
+  offers.push({
+    store: t.store,
+    url: t.url,
+    title: title || null,
+    priceRON: Number(offer.price),
+    currency: offer.currency || "RON",
+    ts: new Date().toISOString(),
+
+    // Gemini enrichment:
+    canonical: norm?.canonical_name ?? null,
+    productKey: norm?.product_key ?? null,
+    brand: norm?.brand ?? null,
+    modelFamily: norm?.model_family ?? null,
+    modelCode: norm?.model_code ?? null,
+    sizeInch: norm?.size_inch ?? null,
+
+    // Debug marker to confirm new code is running:
+    build: "gemini-cache-v1",
+  });
+}
     } catch (e) {
       // ignore target errors; don't fail the whole run
     }
