@@ -3,9 +3,10 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
-      return new Response("OK. Use /cheapest (JSON) or /run (manual).", {
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      });
+      return new Response(
+        "OK. Use /cheapest (JSON), /run (manual), /api/search?q=... (search).",
+        { headers: { "content-type": "text/plain; charset=utf-8" } }
+      );
     }
 
     // Manual run (useful for testing from phone)
@@ -14,12 +15,28 @@ export default {
       return new Response("ran", { status: 200 });
     }
 
-    // View cheapest list
+    // View stored cheapest list
     if (url.pathname === "/cheapest") {
       const id = env.DB.idFromName("main");
       const stub = env.DB.get(id);
       const data = await stub.fetch("https://do.local/get").then((r) => r.json());
       return new Response(JSON.stringify(data, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
+    // Search API for website
+    if (url.pathname === "/api/search") {
+      const q = url.searchParams.get("q")?.trim();
+      if (!q) {
+        return new Response(JSON.stringify({ error: "missing q" }, null, 2), {
+          status: 400,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        });
+      }
+
+      const result = await searchAll(env, q);
+      return new Response(JSON.stringify(result, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8" },
       });
     }
@@ -31,6 +48,10 @@ export default {
     ctx.waitUntil(runJob(env));
   },
 };
+
+/* -----------------------------
+   PART A: Your existing scraper
+   ----------------------------- */
 
 async function runJob(env) {
   const targets = [
@@ -46,7 +67,6 @@ async function runJob(env) {
       store: "mediagalaxy",
       url: "https://mediagalaxy.ro/televizor-oled-evo-smart-lg-65g53ls-ultra-hd-4k-hdr-164cm/cpd/UHDOLED65G53LS/",
     },
-    // Add OLX later with a filtered search URL + dedicated extractor
   ];
 
   const offers = [];
@@ -73,7 +93,6 @@ async function runJob(env) {
       const jsonLd = extractJsonLd(html);
       let offer = pickOfferFromJsonLd(jsonLd);
 
-      // Fallbacks if JSON-LD isn't enough
       if (!offer?.price) offer = pickPriceFromMeta(html) || offer;
       if (!offer?.price) offer = pickPriceFromPatterns(html) || offer;
 
@@ -203,6 +222,207 @@ function toNumberRON(p) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+/* --------------------------------
+   PART B: Search API (/api/search)
+   - pricy.ro (scrape)
+   - mobilissimo RSS (read)
+   - coupons (promo-codes.ro basic)
+   - gemini summary (optional)
+   -------------------------------- */
+
+async function searchAll(env, q) {
+  const debug = { q, steps: [], errors: [] };
+
+  const [pricy, mobilissimo] = await Promise.all([
+    searchPricy(q).catch((e) => ({ error: String(e?.message || e), items: [] })),
+    fetchMobilissimoRss(q).catch((e) => ({ error: String(e?.message || e), items: [] })),
+  ]);
+
+  debug.steps.push({
+    name: "pricy",
+    ok: !pricy.error,
+    count: pricy.items?.length ?? 0,
+    error: pricy.error ?? null,
+  });
+
+  debug.steps.push({
+    name: "mobilissimo_rss",
+    ok: !mobilissimo.error,
+    count: mobilissimo.items?.length ?? 0,
+    error: mobilissimo.error ?? null,
+  });
+
+  // derive domains from pricy item links
+  const domains = new Set();
+  for (const it of pricy.items || []) {
+    try {
+      domains.add(new URL(it.link).hostname.replace(/^www\./, ""));
+    } catch {}
+  }
+
+  // coupons (very basic: site search on promo-codes.ro)
+  const coupons = [];
+  for (const d of [...domains].slice(0, 5)) {
+    coupons.push(await fetchCouponsPromoCodes(d));
+  }
+
+  // Gemini summary (optional)
+  const summary = await geminiSummarize(env, { q, pricy, mobilissimo, coupons });
+
+  return {
+    q,
+    pricy,
+    mobilissimo,
+    coupons,
+    summary,
+    ts: new Date().toISOString(),
+    debug,
+  };
+}
+
+// --- Pricy scraper (heuristic; may need tuning)
+async function searchPricy(q) {
+  // Known pattern that accepts q=. If this ever stops working, change the URL.
+  const queryUrl = `https://www.pricy.ro/productsv2/magazin-storel.ro/generic-color-verde?q=${encodeURIComponent(
+    q
+  )}`;
+
+  const resp = await fetch(queryUrl, {
+    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
+  });
+
+  if (!resp.ok) return { error: `pricy_http_${resp.status}`, queryUrl, items: [] };
+
+  const html = await resp.text();
+
+  // Heuristic: find "lei" prices + nearest href
+  const items = [];
+  const re =
+    /href="([^"]+)"[\s\S]{0,400}?(\d[\d.\s]{2,})\s*lei/gi;
+
+  let m;
+  while ((m = re.exec(html)) && items.length < 25) {
+    const href = m[1];
+    const link = href.startsWith("http")
+      ? href
+      : new URL(href, "https://www.pricy.ro").toString();
+
+    const priceRON = parseInt(m[2].replace(/\s+/g, "").replace(/\./g, ""), 10);
+    if (!Number.isFinite(priceRON) || priceRON <= 0) continue;
+
+    items.push({
+      title: null,
+      link,
+      priceRON,
+    });
+  }
+
+  // Deduplicate by link, keep cheapest
+  const bestByLink = new Map();
+  for (const it of items) {
+    const prev = bestByLink.get(it.link);
+    if (!prev || it.priceRON < prev.priceRON) bestByLink.set(it.link, it);
+  }
+
+  const out = [...bestByLink.values()].sort((a, b) => a.priceRON - b.priceRON).slice(0, 10);
+  return { queryUrl, items: out };
+}
+
+// --- Mobilissimo RSS (filter by q)
+async function fetchMobilissimoRss(q) {
+  const feed = "http://feeds.feedburner.com/telefoane-mobilissimo";
+  const resp = await fetch(feed);
+  if (!resp.ok) return { error: `rss_http_${resp.status}`, items: [] };
+
+  const xml = await resp.text();
+  const rawItems = [...xml.matchAll(/<item>[\s\S]*?<\/item>/g)].slice(0, 40);
+
+  const items = rawItems
+    .map((x) => {
+      const b = x[0];
+      const title =
+        (b.match(/<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>/) ||
+          b.match(/<title>([\s\S]*?)<\/title>/))?.[1]?.trim() || null;
+      const link = b.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() || null;
+      const pubDate = b.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1]?.trim() || null;
+      return { title, link, pubDate };
+    })
+    .filter((x) => {
+      if (!q) return true;
+      return (x.title || "").toLowerCase().includes(q.toLowerCase());
+    })
+    .slice(0, 10);
+
+  return { items };
+}
+
+// --- Coupons (basic; may need tuning to promo-codes.ro structure)
+async function fetchCouponsPromoCodes(domain) {
+  const searchUrl = `https://promo-codes.ro/?s=${encodeURIComponent(domain)}`;
+
+  const resp = await fetch(searchUrl, {
+    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
+  });
+
+  if (!resp.ok) return { domain, items: [], error: `coupon_http_${resp.status}`, searchUrl };
+
+  const html = await resp.text();
+
+  // Heuristic: detect coupon-like codes (A-Z0-9 4..14)
+  const items = [];
+  const codeRe = /\b([A-Z0-9]{4,14})\b/g;
+  let m;
+  while ((m = codeRe.exec(html)) && items.length < 8) {
+    const code = m[1];
+    // avoid capturing common noise tokens
+    if (["HTTP", "HTML", "COOKIE", "LOGIN", "ORDER"].includes(code)) continue;
+    items.push({ title: "Coupon", code, note: "source: promo-codes.ro" });
+  }
+
+  return { domain, items, searchUrl };
+}
+
+// --- Gemini summary for search results
+async function geminiSummarize(env, payload) {
+  if (!env.GEMINI_API_KEY) return null;
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const prompt =
+`You are a price assistant for Romania.
+Given JSON results, produce:
+1) Cheapest 3 offers (price + link)
+2) Any relevant Mobilissimo items (max 3)
+3) Coupons by domain
+Keep it concise.
+JSON:
+${JSON.stringify(payload)}`;
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.2 },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) return null;
+
+  const data = await resp.json();
+  return data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") ?? null;
+}
+
+/* --------------------------------
+   Gemini normalization cache (DO)
+   -------------------------------- */
+
 function stableKeyFromTitle(title) {
   return (title || "")
     .toLowerCase()
@@ -272,7 +492,10 @@ Title: ${title}`;
   }
 }
 
-// Durable Object for storage + normalization cache
+/* -----------------------------
+   Durable Object storage
+   ----------------------------- */
+
 export class DB {
   constructor(state, env) {
     this.state = state;
@@ -281,6 +504,7 @@ export class DB {
   async fetch(request) {
     const url = new URL(request.url);
 
+    // normalization cache
     if (url.pathname === "/norm-get") {
       const key = url.searchParams.get("k");
       const v = key ? await this.state.storage.get("norm:" + key) : null;
@@ -295,6 +519,7 @@ export class DB {
       return new Response("ok");
     }
 
+    // cheapest payload storage
     if (url.pathname === "/put") {
       const body = await request.json();
       await this.state.storage.put("data", body);
