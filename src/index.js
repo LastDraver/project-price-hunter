@@ -298,42 +298,90 @@ async function searchAll(env, q) {
 }
 
 // --- Pricy scraper (heuristic; may need tuning)
+// --- Pricy scraper (improved: only real product links + better titles)
 async function searchPricy(q) {
-  // Known pattern that accepts q=. If this ever stops working, change the URL.
   const queryUrl = `https://www.pricy.ro/productsv2/magazin-storel.ro/generic-color-verde?q=${encodeURIComponent(
     q
   )}`;
 
   const resp = await fetch(queryUrl, {
-    headers: { "user-agent": "Mozilla/5.0", "accept-language": "ro-RO,ro;q=0.9" },
+    headers: {
+      "user-agent": "Mozilla/5.0",
+      "accept-language": "ro-RO,ro;q=0.9",
+    },
   });
 
   if (!resp.ok) return { error: `pricy_http_${resp.status}`, queryUrl, items: [] };
 
   const html = await resp.text();
 
-  // Heuristic: find "lei" prices + nearest href
   const items = [];
-  const re =
-    /href="([^"]+)"[\s\S]{0,400}?(\d[\d.\s]{2,})\s*lei/gi;
+  const re = /href="([^"]+)"[\s\S]{0,500}?(\d[\d.\s]{2,})\s*lei/gi;
 
   let m;
-  while ((m = re.exec(html)) && items.length < 25) {
-    const href = m[1];
-    const link = href.startsWith("http")
-      ? href
-      : new URL(href, "https://www.pricy.ro").toString();
-
+  while ((m = re.exec(html)) && items.length < 80) {
+    const hrefRaw = m[1] || "";
     const priceRON = parseInt(m[2].replace(/\s+/g, "").replace(/\./g, ""), 10);
     if (!Number.isFinite(priceRON) || priceRON <= 0) continue;
 
-    items.push({
-      title: null,
-      link,
-      priceRON,
-    });
+    // Normalize absolute link
+    const link = hrefRaw.startsWith("http")
+      ? hrefRaw
+      : new URL(hrefRaw, "https://www.pricy.ro").toString();
+
+    // Keep ONLY product pages (Pricy uses /ProductUrlId/<id>/<slug>)
+    // This removes min-price/max-price links and other navigation pages.
+    const u = safeUrl(link);
+    if (!u) continue;
+    if (u.hostname !== "www.pricy.ro" && u.hostname !== "pricy.ro") continue;
+
+    const isProduct = u.pathname.includes("/ProductUrlId/");
+    if (!isProduct) continue;
+
+    // Extract title from URL slug (last path segment after id)
+    // Example: /ProductUrlId/12345/lg-oled-65g53ls
+    const title = titleFromPricyPath(u.pathname);
+
+    items.push({ title, link: u.toString(), priceRON });
   }
 
+  // Deduplicate by link, keep cheapest
+  const bestByLink = new Map();
+  for (const it of items) {
+    const prev = bestByLink.get(it.link);
+    if (!prev || it.priceRON < prev.priceRON) bestByLink.set(it.link, it);
+  }
+
+  const out = [...bestByLink.values()]
+    .sort((a, b) => a.priceRON - b.priceRON)
+    .slice(0, 10);
+
+  return { queryUrl, items: out };
+}
+
+function safeUrl(s) {
+  try {
+    return new URL(s);
+  } catch {
+    return null;
+  }
+}
+
+function titleFromPricyPath(pathname) {
+  const parts = (pathname || "").split("/").filter(Boolean);
+  // find "ProductUrlId" index
+  const idx = parts.findIndex((p) => p === "ProductUrlId");
+  if (idx === -1) return null;
+
+  // expected: ["ProductUrlId", "<id>", "<slug...>"]
+  const slug = parts[idx + 2] || "";
+  if (!slug) return null;
+
+  return decodeURIComponent(slug)
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
   // Deduplicate by link, keep cheapest
   const bestByLink = new Map();
   for (const it of items) {
