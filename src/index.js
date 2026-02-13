@@ -47,25 +47,30 @@ export default {
     }
 
     if (url.pathname === "/api/search") {
-      const q = (url.searchParams.get("q") || "").trim();
-      if (!q) return json({ error: "missing q" }, 400);
+  const q = (url.searchParams.get("q") || "").trim();
+  if (!q) return json({ error: "missing q" }, 400);
 
-      const budget = numOrNull(url.searchParams.get("budget"));
-      const sizeMin = numOrNull(url.searchParams.get("sizeMin"));
-      const sizeMax = numOrNull(url.searchParams.get("sizeMax"));
-      const condition = (url.searchParams.get("condition") || "any").trim().toLowerCase(); // any|new|used|resealed
+  const budget = numOrNull(url.searchParams.get("budget"));
+  const sizeMin = numOrNull(url.searchParams.get("sizeMin"));
+  const sizeMax = numOrNull(url.searchParams.get("sizeMax"));
+  const condition = (url.searchParams.get("condition") || "any").trim().toLowerCase();
 
-      const input = {
-        q,
-        budget,
-        sizeMin,
-        sizeMax,
-        condition,
-      };
+  const input = { q, budget, sizeMin, sizeMax, condition };
 
-      const result = await runSearchWithCache(env, input);
-      return json(result, 200);
-    }
+  try {
+    const result = await runSearchWithCache(env, input);
+    return json(result, 200);
+  } catch (e) {
+    return json(
+      {
+        error: "worker_exception",
+        message: String(e?.message || e),
+        stack: e?.stack ? String(e.stack).slice(0, 2000) : null,
+      },
+      500
+    );
+  }
+}
 
     return new Response("Not found", { status: 404, headers: corsHeaders() });
   },
