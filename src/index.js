@@ -125,7 +125,67 @@ function extractJsonLd(html) {
   }
   return out;
 }
+function stableKeyFromTitle(title) {
+  return (title || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9" ]/g, "")
+    .trim()
+    .slice(0, 180);
+}
 
+async function getCachedNorm(env, cacheKey) {
+  const id = env.DB.idFromName("main");
+  const stub = env.DB.get(id);
+  return stub.fetch("https://do.local/norm-get?k=" + encodeURIComponent(cacheKey)).then(r => r.json());
+}
+
+async function putCachedNorm(env, cacheKey, value) {
+  const id = env.DB.idFromName("main");
+  const stub = env.DB.get(id);
+  return stub.fetch("https://do.local/norm-put", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key: cacheKey, value }),
+  });
+}
+
+async function geminiNormalizeTitle(env, title) {
+  if (!env.GEMINI_API_KEY || !title) return null;
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  const prompt =
+`Extract product identity from this Romanian e-commerce title.
+Return ONLY JSON with keys: brand, model_family, model_code, size_inch, canonical_name, product_key.
+Title: ${title}`;
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: "application/json"
+    }
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) return null;
+
+  const data = await resp.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ?? "";
+  if (!text) return null;
+
+  try { return JSON.parse(text); } catch { return null; }
+}
 function pickOfferFromJsonLd(arr) {
   // Loose heuristic: find Product -> offers -> price
   for (const obj of arr) {
