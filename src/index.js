@@ -53,7 +53,7 @@ if (request.method === "OPTIONS") {
     }
 
     return new Response("Not found", { status: 404 });
-  },
+  }
 
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runJob(env));
