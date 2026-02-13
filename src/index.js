@@ -1,65 +1,71 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    // CORS preflight
-if (request.method === "OPTIONS") {
-  return new Response(null, {
-    headers: {
-      "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "content-type",
-      "access-control-max-age": "86400",
-    },
-  });
-}
-    if (url.pathname === "/") {
-     return new Response(JSON.stringify(result, null, 2), {
-  headers: {
-    "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
-  },
-});
 
-    // Manual run (useful for testing from phone)
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET,POST,OPTIONS",
+          "access-control-allow-headers": "content-type",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
+    if (url.pathname === "/") {
+      return new Response(
+        "OK. Use /cheapest (JSON), /run (manual), /api/search?q=... (search).",
+        { headers: { "content-type": "text/plain; charset=utf-8" } }
+      );
+    }
+
     if (url.pathname === "/run") {
       await runJob(env);
       return new Response("ran", { status: 200 });
     }
 
-    // View stored cheapest list
     if (url.pathname === "/cheapest") {
       const id = env.DB.idFromName("main");
       const stub = env.DB.get(id);
       const data = await stub.fetch("https://do.local/get").then((r) => r.json());
       return new Response(JSON.stringify(data, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "access-control-allow-origin": "*",
+        },
       });
     }
 
-    // Search API for website
     if (url.pathname === "/api/search") {
       const q = url.searchParams.get("q")?.trim();
       if (!q) {
         return new Response(JSON.stringify({ error: "missing q" }, null, 2), {
           status: 400,
-          headers: { "content-type": "application/json; charset=utf-8" },
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "access-control-allow-origin": "*",
+          },
         });
       }
 
       const result = await searchAll(env, q);
       return new Response(JSON.stringify(result, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "access-control-allow-origin": "*",
+        },
       });
     }
 
     return new Response("Not found", { status: 404 });
-  }
+  },
 
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runJob(env));
   },
 };
-
 /* -----------------------------
    PART A: Your existing scraper
    ----------------------------- */
