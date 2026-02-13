@@ -543,7 +543,7 @@ async function googleCseSearch(env, query, num = 6) {
     env.GOOGLE_CSE_API_KEY
   )}&cx=${encodeURIComponent(env.GOOGLE_CSE_CX)}&q=${encodeURIComponent(query)}&num=${clamp(num, 1, 10)}&gl=ro&hl=ro`;
 
-  const resp = await fetchWithTimeout(api, {}, 9000);
+  const resp = await fetchWithTimeout(api, {}, 25000);
   if (!resp.ok) return { error: `google_http_${resp.status}`, items: [] };
 
   const data = await resp.json();
