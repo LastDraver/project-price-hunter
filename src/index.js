@@ -1,7 +1,17 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
+    // CORS preflight
+if (request.method === "OPTIONS") {
+  return new Response(null, {
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "content-type",
+      "access-control-max-age": "86400",
+    },
+  });
+}
     if (url.pathname === "/") {
       return new Response(
         "OK. Use /cheapest (JSON), /run (manual), /api/search?q=... (search).",
